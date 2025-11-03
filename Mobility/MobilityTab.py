@@ -3,7 +3,57 @@
 import os, csv, glob, math, datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import tkinter.scrolledtext as scrolledtext
+
+# NEW: LaTeX/preview stack (same libs as Swiss_Army_knife.py)
+import shutil, io, os, tempfile
+from PIL import Image, ImageTk
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.mathtext import MathTextParser
+
 from functions_and_helpers.mobility import compute_mobility, JOINT_FI_DEFAULTS
+# --- LaTeX rendering helpers (lifted from Swiss_Army_knife.py, trimmed) ---
+
+
+# --- LaTeX rendering helpers (lifted from Swiss_Army_knife.py, trimmed) ---
+def _has_usetex_toolchain() -> bool:
+    has_tex = shutil.which("latex") or shutil.which("pdflatex")
+    has_raster = shutil.which("dvipng") or shutil.which("gs") or shutil.which("ghostscript")
+    return bool(has_tex and has_raster)
+
+def _render_mathtex_to_pil(mathtex: str, dpi: int = 220, fg="black", bg="white") -> Image.Image:
+    parser = MathTextParser("agg")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp.close()
+    try:
+        parser.to_png(tmp.name, mathtex, dpi=dpi, color=fg)
+        im = Image.open(tmp.name).convert("RGBA")
+        if bg is not None:
+            bg_img = Image.new("RGBA", im.size, bg)
+            bg_img.paste(im, (0, 0), im)
+            im = bg_img
+        return im
+    finally:
+        try: os.unlink(tmp.name)
+        except Exception: pass
+
+def _render_usetex_line_to_pil(mathtex: str, dpi: int = 220, fg="black", bg="white") -> Image.Image:
+    from matplotlib import rcParams
+    prev_usetex = rcParams.get("text.usetex", False)
+    prev_preamble = rcParams.get("text.latex.preamble", "")
+    try:
+        rcParams["text.usetex"] = True
+        rcParams["text.latex.preamble"] = r"\usepackage{amsmath}"
+        fig = plt.Figure(figsize=(10, 1), dpi=dpi)
+        ax = fig.add_subplot(111); ax.axis("off")
+        ax.text(0.02, 0.98, mathtex, va="top", ha="left", fontsize=18, color=fg, transform=ax.transAxes)
+        buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.15, facecolor=bg)
+        buf.seek(0); return Image.open(buf).convert("RGBA")
+    finally:
+        rcParams["text.usetex"] = prev_usetex
+        rcParams["text.latex.preamble"] = prev_preamble
 
 PAD = 8
 
@@ -142,6 +192,7 @@ class MobilityTab(ttk.Frame):
         btn_row.grid(row=9, column=0, columnspan=8, sticky="e", padx=PAD, pady=(0, PAD))
         ttk.Button(btn_row, text="Compute Mobility", command=self._recompute).pack(side="right")
         ttk.Button(btn_row, text="Copy Output", command=self._copy_output).pack(side="right", padx=(0, 8))
+        ttk.Button(btn_row, text="Open LaTeX Preview", command=self._open_latex_preview).pack(side="right", padx=(0, 8))
 
         # Build examples dropdown from files in this folder
         self._refresh_examples_list()
@@ -342,12 +393,156 @@ class MobilityTab(ttk.Frame):
                                 f"  n = {n}, j = {j}, spherical={bool(self.is_spherical_var.get())}, ΔM = {deltaM}\n")
         self.output_text.insert("end",
                                 f"  fi list (per joint): {', '.join(f'{fi:g}' for fi in fi_list) if fi_list else '(none)'}\n")
+
+        # --- Build LaTeX lines for the preview window ---
+        self._latex_lines = []  # list of (title, "$...$")
+
+        def _sigma_terms(base: int) -> str:
+            return " + ".join([f"({base} - {fi:g})" for fi in fi_list]) if fi_list else "0"
+
+        sigma3 = _sigma_terms(3)
+        sigma6 = _sigma_terms(6)
+        sumfi = f"{sum_fi:.6g}"
+        dM = f"{deltaM:.6g}"
+
+        if spherical:
+            if n_eq_j:
+                # M = Σ f_i - 3 + ΔM
+                self._latex_lines.append(("Spherical closed",
+                                          rf"$M \;=\; \sum f_i - 3 + \Delta M \;=\; {sumfi} - 3 + {dM} \;=\; {M_spherical_closed:.6g}$"))
+            else:
+                # M = 3(n-1) - Σ(3 - f_i) + ΔM
+                self._latex_lines.append(("Spherical general",
+                                          rf"$M \;=\; 3(n-1) - \sum(3 - f_i) + \Delta M \;=\; 3({n}-1) - ({sigma3}) + {dM} \;=\; {M_spherical_general:.6g}$"))
+        else:
+            if n_eq_j:
+                # M = Σ f_i - 6 + ΔM
+                self._latex_lines.append(("Spatial closed",
+                                          rf"$M \;=\; \sum f_i - 6 + \Delta M \;=\; {sumfi} - 6 + {dM} \;=\; {M_spatial_closed:.6g}$"))
+            else:
+                # M = 6(n-1) - Σ(6 - f_i) + ΔM
+                self._latex_lines.append(("Spatial general",
+                                          rf"$M \;=\; 6(n-1) - \sum(6 - f_i) + \Delta M \;=\; 6({n}-1) - ({sigma6}) + {dM} \;=\; {M_spatial_general:.6g}$"))
+            if group_num is not None:
+                # G = Σ f_i - 3 + ΔM  (equivalent spherical mobility)
+                self._latex_lines.append(("Equivalent spherical mobility (Group)",
+                                          rf"$G \;=\; \sum f_i - 3 + \Delta M \;=\; {sumfi} - 3 + {dM} \;=\; {group_num:.6g}$"))
+
         self.output_text.configure(state="disabled")
 
     def _copy_output(self):
         txt = self.output_text.get("1.0","end-1c")
         self.clipboard_clear(); self.clipboard_append(txt)
         messagebox.showinfo("Copied", "Results copied to clipboard.")
+
+    def _open_latex_preview(self):
+        # Make sure we have something to show
+        if not hasattr(self, "_latex_lines") or not self._latex_lines:
+            messagebox.showinfo("LaTeX", "No LaTeX results yet. Click Compute first.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Mobility — LaTeX Preview")
+        win.geometry("1100x800")
+        win.configure(bg="white")
+
+        # Toolbar
+        bar = ttk.Frame(win);
+        bar.pack(side="top", fill="x")
+        ttk.Label(bar, text="Render mode:").pack(side="left", padx=(8, 4))
+        mode_var = tk.StringVar(value="Auto")
+        ttk.Combobox(bar, textvariable=mode_var, values=["Auto", "LaTeX", "MathText"],
+                     width=10, state="readonly").pack(side="left", padx=(0, 10))
+        ttk.Label(bar, text="DPI:").pack(side="left", padx=(8, 4))
+        dpi_var = tk.IntVar(value=220)
+        ttk.Spinbox(bar, from_=100, to=500, increment=20, textvariable=dpi_var, width=6).pack(side="left", padx=(0, 10))
+        save_btn = ttk.Button(bar, text="Save all as PNGs…")
+        save_btn.pack(side="left", padx=6)
+        rerender_btn = ttk.Button(bar, text="Re-render")
+        rerender_btn.pack(side="left", padx=6)
+
+        # Scrollable canvas
+        outer = ttk.Frame(win);
+        outer.pack(side="top", fill="both", expand=True)
+        ysb = ttk.Scrollbar(outer, orient="vertical")
+        xsb = ttk.Scrollbar(outer, orient="horizontal")
+        canvas = tk.Canvas(outer, bd=0, highlightthickness=0, background="white",
+                           yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        ysb.config(command=canvas.yview);
+        xsb.config(command=canvas.xview)
+        ysb.pack(side="right", fill="y");
+        xsb.pack(side="bottom", fill="x")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas);
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win._photo_refs = []
+
+        def _clear():
+            for w in inner.winfo_children(): w.destroy()
+            win._photo_refs.clear()
+
+        def _render_all():
+            _clear()
+            dpi = int(dpi_var.get())
+            want = mode_var.get()
+            use_tex = (want == "LaTeX") or (want == "Auto" and _has_usetex_toolchain())
+            for i, (title, mt) in enumerate(self._latex_lines, start=1):
+                mathline = mt if mt.strip().startswith("$") else f"${mt.strip()}$"
+                try:
+                    img = _render_usetex_line_to_pil(mathline, dpi=dpi) if use_tex \
+                        else _render_mathtex_to_pil(mathline, dpi=dpi)
+                except Exception:
+                    # swap fallback if first choice failed
+                    try:
+                        img = _render_mathtex_to_pil(mathline, dpi=dpi) if use_tex \
+                            else _render_usetex_line_to_pil(mathline, dpi=dpi)
+                    except Exception:
+                        img = None
+                if img is None:
+                    # fall back to plain text
+                    lbl = tk.Label(inner, text=f"{title}: {mathline}", bg="white", anchor="w", justify="left")
+                    lbl.pack(fill="x", padx=10, pady=6)
+                    continue
+                ph = ImageTk.PhotoImage(img)
+                lab_title = tk.Label(inner, text=title, bg="white", anchor="w", justify="left")
+                lab_title.pack(fill="x", padx=10, pady=(12 if i > 1 else 6))
+                lbl = tk.Label(inner, image=ph, bg="white");
+                lbl.image = ph
+                win._photo_refs.append(ph);
+                lbl.pack(anchor="w", padx=12, pady=(2, 4))
+
+        def _save_all():
+            if not self._latex_lines: return
+            out_dir = filedialog.askdirectory(title="Select folder to save LaTeX images")
+            if not out_dir: return
+            dpi = int(dpi_var.get())
+            want = mode_var.get()
+            use_tex = (want == "LaTeX") or (want == "Auto" and _has_usetex_toolchain())
+            saved = 0
+            for i, (title, mt) in enumerate(self._latex_lines, start=1):
+                mathline = mt if mt.strip().startswith("$") else f"${mt.strip()}$"
+                try:
+                    img = _render_usetex_line_to_pil(mathline, dpi=dpi) if use_tex \
+                        else _render_mathtex_to_pil(mathline, dpi=dpi)
+                except Exception:
+                    try:
+                        img = _render_mathtex_to_pil(mathline, dpi=dpi) if use_tex \
+                            else _render_usetex_line_to_pil(mathline, dpi=dpi)
+                    except Exception:
+                        img = None
+                if img is None: continue
+                safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in title).strip("_") or f"line_{i}"
+                path = os.path.join(out_dir, f"{i:02d}_{safe}.png")
+                try:
+                    img.save(path); saved += 1
+                except Exception:
+                    pass
+            messagebox.showinfo("Save All", f"Saved {saved} image(s) to:\n{out_dir}")
+
+        rerender_btn.configure(command=_render_all)
+        save_btn.configure(command=_save_all)
+        _render_all()
 
     # ---------- Save/Load/Examples ----------
     def _state_to_dict(self):
